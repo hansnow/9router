@@ -125,6 +125,254 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
   return responseBody;
 }
 
+function firstTextContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      if (part.type === "text" || part.type === "output_text") return part.text || "";
+      return "";
+    })
+    .join("");
+}
+
+function firstReasoningContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      if (part.type === "thinking") return part.thinking || "";
+      if (part.type === "reasoning") {
+        return Array.isArray(part.summary)
+          ? part.summary.map((summaryPart) => summaryPart?.text || "").join("")
+          : "";
+      }
+      return "";
+    })
+    .join("");
+}
+
+function usageToResponses(usage) {
+  if (!usage || typeof usage !== "object") return usage;
+
+  const inputTokens = usage.input_tokens ?? usage.prompt_tokens;
+  const outputTokens = usage.output_tokens ?? usage.completion_tokens;
+  const responseUsage = {};
+
+  if (inputTokens !== undefined) responseUsage.input_tokens = inputTokens;
+  if (outputTokens !== undefined) responseUsage.output_tokens = outputTokens;
+  if (usage.total_tokens !== undefined) {
+    responseUsage.total_tokens = usage.total_tokens;
+  } else if (inputTokens !== undefined && outputTokens !== undefined) {
+    responseUsage.total_tokens = inputTokens + outputTokens;
+  }
+  if (usage.input_tokens_details) responseUsage.input_tokens_details = usage.input_tokens_details;
+  if (usage.output_tokens_details) responseUsage.output_tokens_details = usage.output_tokens_details;
+  if (usage.prompt_tokens_details) responseUsage.input_tokens_details = usage.prompt_tokens_details;
+  if (usage.completion_tokens_details) responseUsage.output_tokens_details = usage.completion_tokens_details;
+  if (usage.estimated !== undefined) responseUsage.estimated = usage.estimated;
+
+  return responseUsage;
+}
+
+function usageToClaude(usage) {
+  if (!usage || typeof usage !== "object") return usage;
+
+  const claudeUsage = {};
+  const cacheReadTokens = usage.cache_read_input_tokens ?? usage.prompt_tokens_details?.cached_tokens;
+  const cacheCreateTokens = usage.cache_creation_input_tokens ?? usage.prompt_tokens_details?.cache_creation_tokens;
+  const inputTokens = usage.input_tokens ?? (
+    usage.prompt_tokens !== undefined
+      ? Math.max(0, usage.prompt_tokens - (cacheReadTokens || 0) - (cacheCreateTokens || 0))
+      : undefined
+  );
+  const outputTokens = usage.output_tokens ?? usage.completion_tokens;
+
+  if (inputTokens !== undefined) claudeUsage.input_tokens = inputTokens;
+  if (outputTokens !== undefined) claudeUsage.output_tokens = outputTokens;
+  if (cacheReadTokens !== undefined) claudeUsage.cache_read_input_tokens = cacheReadTokens;
+  if (cacheCreateTokens !== undefined) claudeUsage.cache_creation_input_tokens = cacheCreateTokens;
+  if (usage.estimated !== undefined) claudeUsage.estimated = usage.estimated;
+
+  return claudeUsage;
+}
+
+function mapOpenAIStopReasonToClaude(finishReason) {
+  if (finishReason === "length" || finishReason === "max_tokens") return "max_tokens";
+  if (finishReason === "tool_calls") return "tool_use";
+  return "end_turn";
+}
+
+function responseIncompleteReason(finishReason) {
+  if (finishReason === "length" || finishReason === "max_tokens") return "max_output_tokens";
+  if (finishReason === "content_filter") return "content_filter";
+  return null;
+}
+
+function chatCompletionToResponses(response, model) {
+  if (response?.object !== "chat.completion" || !Array.isArray(response.choices)) return response;
+
+  const choice = response.choices[0] || {};
+  const message = choice.message || {};
+  const output = [];
+  const text = firstTextContent(message.content);
+  const reasoning = message.reasoning_content || message.reasoning || "";
+  const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+  const incompleteReason = responseIncompleteReason(choice.finish_reason);
+  const isIncomplete = Boolean(incompleteReason);
+
+  if (reasoning) {
+    output.push({
+      id: `rs_${response.id || Date.now()}`,
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: reasoning }]
+    });
+  }
+
+  if (text || (!reasoning && !hasToolCalls)) {
+    output.push({
+      id: `msg_${response.id || Date.now()}`,
+      type: "message",
+      status: isIncomplete ? "incomplete" : "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }]
+    });
+  }
+
+  if (hasToolCalls) {
+    for (const toolCall of message.tool_calls) {
+      output.push({
+        id: toolCall.id || `fc_${Date.now()}`,
+        type: "function_call",
+        status: "completed",
+        call_id: toolCall.id || `call_${Date.now()}`,
+        name: toolCall.function?.name || "",
+        arguments: toolCall.function?.arguments || ""
+      });
+    }
+  }
+
+  return {
+    id: String(response.id || `resp_${Date.now()}`).replace(/^chatcmpl-/, "resp_"),
+    object: "response",
+    created_at: response.created || Math.floor(Date.now() / 1000),
+    status: isIncomplete ? "incomplete" : "completed",
+    background: false,
+    error: null,
+    incomplete_details: incompleteReason ? { reason: incompleteReason } : null,
+    instructions: null,
+    max_output_tokens: null,
+    model: response.model || model,
+    output,
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: true,
+    temperature: null,
+    text: { format: { type: "text" } },
+    tool_choice: "auto",
+    tools: [],
+    top_p: null,
+    truncation: "disabled",
+    usage: usageToResponses(response.usage)
+  };
+}
+
+function chatCompletionToClaude(response, model) {
+  if (response?.object !== "chat.completion" || !Array.isArray(response.choices)) return response;
+
+  const choice = response.choices[0] || {};
+  const message = choice.message || {};
+  const content = [];
+  const text = firstTextContent(message.content);
+  const reasoning = message.reasoning_content || message.reasoning || "";
+  const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+
+  if (reasoning) {
+    content.push({ type: "thinking", thinking: reasoning });
+  }
+
+  if (text || (!reasoning && !hasToolCalls)) {
+    content.push({ type: "text", text });
+  }
+
+  if (hasToolCalls) {
+    for (const toolCall of message.tool_calls) {
+      let input = {};
+      try {
+        input = JSON.parse(toolCall.function?.arguments || "{}");
+      } catch {
+        input = {};
+      }
+      content.push({
+        type: "tool_use",
+        id: toolCall.id || `toolu_${Date.now()}`,
+        name: toolCall.function?.name || "",
+        input
+      });
+    }
+  }
+
+  return {
+    id: String(response.id || `msg_${Date.now()}`).replace(/^chatcmpl-/, "msg_"),
+    type: "message",
+    role: "assistant",
+    model: response.model || model,
+    content,
+    stop_reason: mapOpenAIStopReasonToClaude(choice.finish_reason),
+    stop_sequence: null,
+    usage: usageToClaude(response.usage)
+  };
+}
+
+function convertNonStreamingResponseForClient(response, sourceFormat, model) {
+  if (sourceFormat === FORMATS.OPENAI_RESPONSES || sourceFormat === FORMATS.OPENAI_RESPONSE) {
+    return chatCompletionToResponses(response, model);
+  }
+  if (sourceFormat === FORMATS.CLAUDE) {
+    return chatCompletionToClaude(response, model);
+  }
+  return response;
+}
+
+function extractResponseSummary(response) {
+  if (response?.choices?.[0]) {
+    return {
+      content: response.choices[0].message?.content || null,
+      thinking: response.choices[0].message?.reasoning_content || null,
+      finish_reason: response.choices[0].finish_reason || "unknown"
+    };
+  }
+
+  if (response?.object === "response") {
+    const message = response.output?.find((item) => item.type === "message");
+    const reasoning = response.output?.find((item) => item.type === "reasoning");
+    return {
+      content: firstTextContent(message?.content) || null,
+      thinking: firstReasoningContent([reasoning]) || null,
+      finish_reason: response.status || "unknown"
+    };
+  }
+
+  if (response?.type === "message") {
+    return {
+      content: firstTextContent(response.content) || null,
+      thinking: firstReasoningContent(response.content) || null,
+      finish_reason: response.stop_reason || "unknown"
+    };
+  }
+
+  return {
+    content: response?.content || null,
+    thinking: response?.reasoning_content || null,
+    finish_reason: "unknown"
+  };
+}
+
 /**
  * Handle non-streaming response from provider.
  */
@@ -186,18 +434,27 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   }
 
   if (translatedResponse?.usage) {
-    translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
+    translatedResponse.usage = addBufferToUsage(translatedResponse.usage);
   }
 
-  // Strip reasoning_content — some clients (e.g. Firecrawl AI SDK) have JSON parsers that
-  // break on this non-standard field, even though OpenAI allows it in extensions.
-  if (translatedResponse?.choices) {
-    for (const choice of translatedResponse.choices) {
-      if (choice?.message) delete choice.message.reasoning_content;
+  const clientResponse = convertNonStreamingResponseForClient(translatedResponse, sourceFormat, model);
+  // Strip reasoning_content only from OpenAI Chat responses. Claude and Responses
+  // clients need it converted into native thinking/reasoning blocks above.
+  if (sourceFormat === FORMATS.OPENAI && clientResponse?.choices) {
+    for (const choice of clientResponse.choices) {
+      const hasToolCalls = Array.isArray(choice?.message?.tool_calls) && choice.message.tool_calls.length > 0;
+      if (choice?.message?.reasoning_content && (choice.message.content || hasToolCalls)) {
+        delete choice.message.reasoning_content;
+      }
     }
   }
+  if (clientResponse?.usage) {
+    clientResponse.usage = filterUsageForFormat(clientResponse.usage, sourceFormat);
+  }
 
-  reqLogger.logConvertedResponse(translatedResponse);
+  reqLogger.logConvertedResponse(clientResponse);
+
+  const responseSummary = extractResponseSummary(clientResponse);
 
   const totalLatency = Date.now() - requestStartTime;
   saveRequestDetail(buildRequestDetail({
@@ -208,9 +465,9 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     providerRequest: finalBody || translatedBody || null,
     providerResponse: responseBody || null,
     response: {
-      content: translatedResponse?.choices?.[0]?.message?.content || translatedResponse?.content || null,
-      thinking: translatedResponse?.choices?.[0]?.message?.reasoning_content || translatedResponse?.reasoning_content || null,
-      finish_reason: translatedResponse?.choices?.[0]?.finish_reason || "unknown"
+      content: responseSummary.content,
+      thinking: responseSummary.thinking,
+      finish_reason: responseSummary.finish_reason
     },
     status: "success"
   }, { endpoint: clientRawRequest?.endpoint || null })).catch(err => {
@@ -219,7 +476,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
 
   return {
     success: true,
-    response: new Response(JSON.stringify(translatedResponse), {
+    response: new Response(JSON.stringify(clientResponse), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     })
   };

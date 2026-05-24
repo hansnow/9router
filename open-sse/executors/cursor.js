@@ -41,17 +41,128 @@ const debugLog = (...args) => {
   if (CURSOR_STREAM_DEBUG) console.log(...args);
 };
 
-function isComposerModel(model) {
+const FINAL_THINKING_MARKERS = ["<|final|>", "<\uFF5Cfinal\uFF5C>"];
+const PSEUDO_TOOL_MARKERS = {
+  callsBegin: "<\uFF5Ctool\u2581calls\u2581begin\uFF5C>",
+  callsEnd: "<\uFF5Ctool\u2581calls\u2581end\uFF5C>",
+  callBegin: "<\uFF5Ctool\u2581call\u2581begin\uFF5C>",
+  callEnd: "<\uFF5Ctool\u2581call\u2581end\uFF5C>",
+  sep: "<\uFF5Ctool\u2581sep\uFF5C>"
+};
+const WHITESPACE_SENSITIVE_PSEUDO_TOOL_ARGS = new Set(["content", "old_string", "new_string"]);
+
+function isThinkingTailVisibleModel(model) {
   const modelId = String(model || "").split("/").pop();
-  return /^composer(?:-|$)/i.test(modelId);
+  return modelId === "default" || /^composer(?:-|$)/i.test(modelId);
 }
 
-function visibleComposerContentFromThinking(thinking) {
+function visibleContentFromThinking(thinking) {
   if (!thinking) return "";
   const endTag = "</think>";
   const endIdx = thinking.lastIndexOf(endTag);
   if (endIdx < 0) return "";
-  return thinking.slice(endIdx + endTag.length).trimStart();
+
+  const visible = thinking.slice(endIdx + endTag.length).trimStart();
+  const lowerVisible = visible.toLowerCase();
+  for (const marker of FINAL_THINKING_MARKERS) {
+    const lowerMarker = marker.toLowerCase();
+    if (lowerVisible === "" || (lowerMarker.startsWith(lowerVisible) && lowerVisible.length < lowerMarker.length)) {
+      return "";
+    }
+    if (lowerVisible.startsWith(lowerMarker)) {
+      return visible.slice(marker.length).trimStart();
+    }
+  }
+  return visible;
+}
+
+function normalizePseudoToolArguments(toolName, args) {
+  const normalizedArgs = {};
+  for (const [key, value] of Object.entries(args)) {
+    normalizedArgs[key] = typeof value === "string" && !WHITESPACE_SENSITIVE_PSEUDO_TOOL_ARGS.has(key)
+      ? value.trim()
+      : value;
+  }
+
+  if (toolName === "Read" && normalizedArgs.path && !normalizedArgs.file_path) {
+    const { path, ...rest } = normalizedArgs;
+    return { ...rest, file_path: path };
+  }
+
+  if (toolName === "Glob") {
+    const normalized = { ...normalizedArgs };
+    if (normalized.glob_pattern && !normalized.pattern) {
+      normalized.pattern = normalized.glob_pattern;
+      delete normalized.glob_pattern;
+    }
+    if (normalized.target_directory && !normalized.path) {
+      normalized.path = normalized.target_directory;
+      delete normalized.target_directory;
+    }
+    return normalized;
+  }
+
+  return normalizedArgs;
+}
+
+function parseCursorPseudoToolCalls(content) {
+  if (!content || !content.includes(PSEUDO_TOOL_MARKERS.callsBegin)) {
+    return { content, toolCalls: [] };
+  }
+
+  const begin = content.indexOf(PSEUDO_TOOL_MARKERS.callsBegin);
+  const end = content.indexOf(PSEUDO_TOOL_MARKERS.callsEnd, begin + PSEUDO_TOOL_MARKERS.callsBegin.length);
+  if (end < 0) {
+    return { content: content.slice(0, begin).trimEnd(), toolCalls: [] };
+  }
+
+  const before = content.slice(0, begin).trimEnd();
+  const after = content.slice(end + PSEUDO_TOOL_MARKERS.callsEnd.length).trimStart();
+  const block = content.slice(begin + PSEUDO_TOOL_MARKERS.callsBegin.length, end);
+  const toolCalls = [];
+
+  let offset = 0;
+  while (offset < block.length) {
+    const callStart = block.indexOf(PSEUDO_TOOL_MARKERS.callBegin, offset);
+    if (callStart < 0) break;
+    const bodyStart = callStart + PSEUDO_TOOL_MARKERS.callBegin.length;
+    const callEnd = block.indexOf(PSEUDO_TOOL_MARKERS.callEnd, bodyStart);
+    if (callEnd < 0) break;
+
+    const callBody = block.slice(bodyStart, callEnd);
+    const firstSep = callBody.indexOf(PSEUDO_TOOL_MARKERS.sep);
+    if (firstSep > 0) {
+      const toolName = callBody.slice(0, firstSep).trim();
+      const args = {};
+      const argBlocks = callBody.slice(firstSep).split(PSEUDO_TOOL_MARKERS.sep).filter(Boolean);
+
+      for (const argBlock of argBlocks) {
+        const newline = argBlock.indexOf("\n");
+        if (newline < 0) continue;
+        const key = argBlock.slice(0, newline).trim();
+        const value = argBlock.slice(newline + 1);
+        if (key) args[key] = value;
+      }
+
+      if (toolName) {
+        const index = toolCalls.length;
+        const normalizedArgs = normalizePseudoToolArguments(toolName, args);
+        toolCalls.push({
+          id: `call_cursor_${Date.now()}_${index}`,
+          type: "function",
+          function: {
+            name: toolName,
+            arguments: JSON.stringify(normalizedArgs)
+          }
+        });
+      }
+    }
+
+    offset = callEnd + PSEUDO_TOOL_MARKERS.callEnd.length;
+  }
+
+  const stripped = [before, after].filter(Boolean).join(after && before ? "\n" : "");
+  return { content: stripped, toolCalls };
 }
 
 function decompressPayload(payload, flags) {
@@ -390,10 +501,7 @@ export class CursorExecutor extends BaseExecutor {
       if (result.thinking) totalThinking += result.thinking;
     }
 
-    const visibleComposerContent = isComposerModel(model)
-      ? visibleComposerContentFromThinking(totalThinking)
-      : "";
-    const finalContent = totalContent || visibleComposerContent;
+    let finalContent = totalContent || (isThinkingTailVisibleModel(model) ? visibleContentFromThinking(totalThinking) : "");
 
     debugLog(
       `[CURSOR BUFFER] Parsed ${frameCount} frames, toolCallsMap size: ${toolCallsMap.size}, finalized toolCalls: ${toolCalls.length}`
@@ -414,6 +522,10 @@ export class CursorExecutor extends BaseExecutor {
         });
       }
     }
+
+    const pseudoToolParse = parseCursorPseudoToolCalls(finalContent);
+    finalContent = pseudoToolParse.content;
+    toolCalls.push(...pseudoToolParse.toolCalls);
 
     debugLog(`[CURSOR BUFFER] Final toolCalls count: ${toolCalls.length}`);
 
@@ -456,12 +568,78 @@ export class CursorExecutor extends BaseExecutor {
     let offset = 0;
     let totalContent = "";
     let totalThinking = "";
-    let emittedComposerThinkingContentLength = 0;
+    let emittedThinkingVisibleContentLength = 0;
     const toolCalls = [];
     const toolCallsMap = new Map(); // Track streaming tool calls by ID
     const finalizedIds = new Set();
-    const emittedToolCallIds = new Set();
     let frameCount = 0;
+    const emitRoleChunk = () => {
+      chunks.push(
+        `data: ${JSON.stringify({
+          id: responseId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "" },
+              finish_reason: null
+            }
+          ]
+        })}\n\n`
+      );
+    };
+    const emitContentChunk = (content) => {
+      if (!content) return;
+      chunks.push(
+        `data: ${JSON.stringify({
+          id: responseId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta:
+                chunks.length === 0
+                  ? { role: "assistant", content }
+                  : { content },
+              finish_reason: null
+            }
+          ]
+        })}\n\n`
+      );
+    };
+    const emitToolCallChunk = (tc, index) => {
+      chunks.push(
+        `data: ${JSON.stringify({
+          id: responseId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index,
+                    id: tc.id,
+                    type: "function",
+                    function: {
+                      name: tc.function.name,
+                      arguments: tc.function.arguments
+                    }
+                  }
+                ]
+              },
+              finish_reason: null
+            }
+          ]
+        })}\n\n`
+      );
+    };
 
     debugLog(`[CURSOR BUFFER SSE] Total length: ${buffer.length} bytes`);
 
@@ -541,61 +719,15 @@ export class CursorExecutor extends BaseExecutor {
       if (result.toolCall) {
         const tc = result.toolCall;
 
-        if (chunks.length === 0) {
-          chunks.push(
-            `data: ${JSON.stringify({
-              id: responseId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { role: "assistant", content: "" },
-                  finish_reason: null
-                }
-              ]
-            })}\n\n`
-          );
-        }
-
         if (toolCallsMap.has(tc.id)) {
           // Accumulate arguments for existing tool call
           const existing = toolCallsMap.get(tc.id);
-          const oldArgsLen = existing.function.arguments.length;
           existing.function.arguments += tc.function.arguments;
           existing.isLast = tc.isLast;
-
-          // Stream the delta arguments
-          if (tc.function.arguments) {
-            emittedToolCallIds.add(tc.id);
-            chunks.push(
-              `data: ${JSON.stringify({
-                id: responseId,
-                object: "chat.completion.chunk",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {
-                      tool_calls: [
-                        {
-                          index: existing.index,
-                          id: tc.id,
-                          type: "function",
-                          function: {
-                            name: tc.function.name,
-                            arguments: tc.function.arguments
-                          }
-                        }
-                      ]
-                    },
-                    finish_reason: null
-                  }
-                ]
-              })}\n\n`
-            );
+          const emitted = toolCalls[existing.index];
+          if (emitted) {
+            emitted.function.arguments = existing.function.arguments;
+            emitted.isLast = existing.isLast;
           }
         } else {
           // New tool call - assign index and add to map
@@ -603,86 +735,20 @@ export class CursorExecutor extends BaseExecutor {
           finalizedIds.add(tc.id);
           toolCalls.push({ ...tc, index: toolCallIndex });
           toolCallsMap.set(tc.id, { ...tc, index: toolCallIndex });
-
-          // Stream initial tool call with name
-          emittedToolCallIds.add(tc.id);
-          chunks.push(
-            `data: ${JSON.stringify({
-              id: responseId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    tool_calls: [
-                      {
-                        index: toolCallIndex,
-                        id: tc.id,
-                        type: "function",
-                        function: {
-                          name: tc.function.name,
-                          arguments: tc.function.arguments
-                        }
-                      }
-                    ]
-                  },
-                  finish_reason: null
-                }
-              ]
-            })}\n\n`
-          );
         }
       }
 
       if (result.text) {
         totalContent += result.text;
-        chunks.push(
-          `data: ${JSON.stringify({
-            id: responseId,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [
-              {
-                index: 0,
-                delta:
-                  chunks.length === 0 && toolCalls.length === 0
-                    ? { role: "assistant", content: result.text }
-                    : { content: result.text },
-                finish_reason: null
-              }
-            ]
-          })}\n\n`
-        );
       }
 
-      if (isComposerModel(model) && result.thinking) {
+      if (isThinkingTailVisibleModel(model) && result.thinking) {
         totalThinking += result.thinking;
-        const visibleContent = visibleComposerContentFromThinking(totalThinking);
-        if (visibleContent.length > emittedComposerThinkingContentLength) {
-          const deltaContent = visibleContent.slice(emittedComposerThinkingContentLength);
-          emittedComposerThinkingContentLength = visibleContent.length;
+        const visibleContent = visibleContentFromThinking(totalThinking);
+        if (visibleContent.length > emittedThinkingVisibleContentLength) {
+          const deltaContent = visibleContent.slice(emittedThinkingVisibleContentLength);
+          emittedThinkingVisibleContentLength = visibleContent.length;
           totalContent += deltaContent;
-          chunks.push(
-            `data: ${JSON.stringify({
-              id: responseId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta:
-                    chunks.length === 0 && toolCalls.length === 0
-                      ? { role: "assistant", content: deltaContent }
-                      : { content: deltaContent },
-                  finish_reason: null
-                }
-              ]
-            })}\n\n`
-          );
         }
       }
     }
@@ -705,56 +771,29 @@ export class CursorExecutor extends BaseExecutor {
             arguments: tc.function.arguments
           }
         });
-
-        // Emit SSE chunk for the finalized tool call if not already emitted
-        if (!emittedToolCallIds.has(tc.id)) {
-          chunks.push(
-            `data: ${JSON.stringify({
-              id: responseId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    tool_calls: [
-                      {
-                        index: toolCallIndex,
-                        id: tc.id,
-                        type: "function",
-                        function: {
-                          name: tc.function.name,
-                          arguments: tc.function.arguments
-                        }
-                      }
-                    ]
-                  },
-                  finish_reason: null
-                }
-              ]
-            })}\n\n`
-          );
-        }
       }
     }
 
+    const pseudoToolParse = parseCursorPseudoToolCalls(totalContent);
+    totalContent = pseudoToolParse.content;
+    emitContentChunk(totalContent);
+
+    if (chunks.length === 0 && (toolCalls.length > 0 || pseudoToolParse.toolCalls.length > 0)) {
+      emitRoleChunk();
+    }
+
+    for (const tc of toolCalls) {
+      emitToolCallChunk(tc, tc.index ?? 0);
+    }
+
+    for (const tc of pseudoToolParse.toolCalls) {
+      const toolCallIndex = toolCalls.length;
+      toolCalls.push({ ...tc, index: toolCallIndex });
+      emitToolCallChunk(tc, toolCallIndex);
+    }
+
     if (chunks.length === 0 && toolCalls.length === 0) {
-      chunks.push(
-        `data: ${JSON.stringify({
-          id: responseId,
-          object: "chat.completion.chunk",
-          created,
-          model,
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: "" },
-              finish_reason: null
-            }
-          ]
-        })}\n\n`
-      );
+      emitRoleChunk();
     }
 
     const usage = estimateUsage(body, totalContent.length, FORMATS.OPENAI);
