@@ -23,6 +23,35 @@ function extractContent(content) {
   return "";
 }
 
+function extractImages(content) {
+  if (!Array.isArray(content)) return [];
+
+  const images = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+
+    if (part.type === "image_url") {
+      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+      if (typeof url === "string" && url.startsWith("data:")) images.push({ url });
+      continue;
+    }
+
+    if (part.type === "image" && part.source?.type === "base64" && part.source?.data) {
+      images.push({
+        url: `data:${part.source.media_type || "image/png"};base64,${part.source.data}`
+      });
+    }
+  }
+  return images;
+}
+
+function extractImageUrl(contentPart) {
+  if (!contentPart || contentPart.type !== "image_url") return "";
+  return typeof contentPart.image_url === "string"
+    ? contentPart.image_url
+    : contentPart.image_url?.url || "";
+}
+
 function sanitizeToolResultText(text) {
   // Strip non-printable control chars that can produce backend request errors
   return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
@@ -102,12 +131,18 @@ function convertMessages(messages) {
     if (msg.role === "user" || msg.role === "assistant") {
       if (msg.role === "user" && Array.isArray(msg.content)) {
         const parts = [];
+        const images = extractImages(msg.content);
         for (const block of msg.content) {
           if (!block || typeof block !== "object") continue;
           if (block.type === "text") {
             if (typeof block.text === "string") {
               parts.push(block.text || "");
             }
+            continue;
+          }
+          if (block.type === "image_url") {
+            const url = extractImageUrl(block);
+            if (url && !url.startsWith("data:")) parts.push(`[Image: ${url}]`);
             continue;
           }
           if (block.type === "tool_result") {
@@ -121,11 +156,14 @@ function convertMessages(messages) {
           }
         }
         const joined = parts.filter(Boolean).join("\n");
-        if (joined) result.push({ role: "user", content: joined });
+        if (joined || images.length > 0) {
+          result.push({ role: "user", content: joined, ...(images.length > 0 ? { images } : {}) });
+        }
         continue;
       }
 
       const content = extractContent(msg.content);
+      const images = msg.role === "user" ? extractImages(msg.content) : [];
 
       if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
         const assistantMsg = { role: "assistant", content: content || "" };
@@ -157,8 +195,8 @@ function convertMessages(messages) {
           result.push({ role: "assistant", content });
         }
       } else {
-        if (content) {
-          result.push({ role: msg.role, content });
+        if (content || images.length > 0) {
+          result.push({ role: msg.role, content, ...(images.length > 0 ? { images } : {}) });
         }
       }
     }

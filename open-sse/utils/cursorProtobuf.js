@@ -57,6 +57,7 @@ const FIELD = {
   // ConversationMessage
   MSG_CONTENT: 1,
   MSG_ROLE: 2,
+  MSG_IMAGES: 10,
   MSG_ID: 13,
   MSG_TOOL_RESULTS: 18,
   MSG_IS_AGENTIC: 29,
@@ -139,6 +140,12 @@ const FIELD = {
   MSGID_ID: 1,
   MSGID_SUMMARY: 2,
   MSGID_ROLE: 3,
+
+  // ImageProto
+  IMAGE_DATA: 1,
+  IMAGE_DIMENSION: 2,
+  IMAGE_WIDTH: 1,
+  IMAGE_HEIGHT: 2,
 
   // MCPTool
   MCP_TOOL_NAME: 1,
@@ -371,11 +378,13 @@ export function encodeToolResult(toolResult) {
   );
 }
 
-export function encodeMessage(content, role, messageId, chatModeEnum = null, isLast = false, hasTools = false, toolResults = [], serverBubbleId = null) {
+export function encodeMessage(content, role, messageId, chatModeEnum = null, isLast = false, hasTools = false, toolResults = [], serverBubbleId = null, images = []) {
   const hasToolResults = toolResults.length > 0;
+  const encodedImages = images.map(encodeImage).filter(Boolean);
   return concatArrays(
     encodeField(FIELD.MSG_CONTENT, WIRE_TYPE.LEN, content),
     encodeField(FIELD.MSG_ROLE, WIRE_TYPE.VARINT, role),
+    ...encodedImages.map(image => encodeField(FIELD.MSG_IMAGES, WIRE_TYPE.LEN, image)),
     encodeField(FIELD.MSG_ID, WIRE_TYPE.LEN, messageId),
     // Only include server_bubble_id if explicitly provided (last assistant message only)
     ...(serverBubbleId ? [encodeField(FIELD.MSG_SERVER_BUBBLE_ID, WIRE_TYPE.LEN, serverBubbleId)] : []),
@@ -442,6 +451,110 @@ export function encodeMcpTool(tool) {
     ...(toolDesc ? [encodeField(FIELD.MCP_TOOL_DESC, WIRE_TYPE.LEN, toolDesc)] : []),
     ...(Object.keys(inputSchema).length > 0 ? [encodeField(FIELD.MCP_TOOL_PARAMS, WIRE_TYPE.LEN, JSON.stringify(inputSchema))] : []),
     encodeField(FIELD.MCP_TOOL_SERVER, WIRE_TYPE.LEN, "custom")
+  );
+}
+
+function parseDataUriImage(url) {
+  if (typeof url !== "string") return null;
+  const match = /^data:([^;,]+)?(?:;[^,]*)?;base64,([\s\S]+)$/i.exec(url.trim());
+  if (!match) return null;
+  try {
+    const buffer = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+    if (buffer.length === 0) return null;
+    return { data: new Uint8Array(buffer) };
+  } catch {
+    return null;
+  }
+}
+
+function readUInt24LE(buffer, offset) {
+  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+function detectImageDimensions(bytes) {
+  const buffer = Buffer.from(bytes);
+
+  // PNG: signature + IHDR width/height at offsets 16/20.
+  if (
+    buffer.length >= 24 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+
+  // JPEG: scan SOF markers.
+  if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      offset += 2;
+      if (marker === 0xd8 || marker === 0xd9) continue;
+      if (offset + 2 > buffer.length) break;
+      const length = buffer.readUInt16BE(offset);
+      if (length < 2 || offset + length > buffer.length) break;
+      const isSof =
+        (marker >= 0xc0 && marker <= 0xc3) ||
+        (marker >= 0xc5 && marker <= 0xc7) ||
+        (marker >= 0xc9 && marker <= 0xcb) ||
+        (marker >= 0xcd && marker <= 0xcf);
+      if (isSof && offset + 7 < buffer.length) {
+        return { width: buffer.readUInt16BE(offset + 5), height: buffer.readUInt16BE(offset + 3) };
+      }
+      offset += length;
+    }
+  }
+
+  // GIF87a/GIF89a: little-endian logical screen size.
+  if (buffer.length >= 10 && buffer.slice(0, 3).toString("ascii") === "GIF") {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+
+  // WebP RIFF container.
+  if (
+    buffer.length >= 30 &&
+    buffer.slice(0, 4).toString("ascii") === "RIFF" &&
+    buffer.slice(8, 12).toString("ascii") === "WEBP"
+  ) {
+    const chunk = buffer.slice(12, 16).toString("ascii");
+    if (chunk === "VP8X" && buffer.length >= 30) {
+      return {
+        width: readUInt24LE(buffer, 24) + 1,
+        height: readUInt24LE(buffer, 27) + 1
+      };
+    }
+    if (chunk === "VP8 " && buffer.length >= 30) {
+      return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+    }
+    if (chunk === "VP8L" && buffer.length >= 25) {
+      const b0 = buffer[21], b1 = buffer[22], b2 = buffer[23], b3 = buffer[24];
+      return {
+        width: 1 + (((b1 & 0x3f) << 8) | b0),
+        height: 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
+      };
+    }
+  }
+
+  return { width: 0, height: 0 };
+}
+
+export function encodeImage(image) {
+  const parsed = parseDataUriImage(image?.url || image?.image_url || image?.dataUrl || "");
+  if (!parsed) return null;
+  const { width, height } = detectImageDimensions(parsed.data);
+  const dimension = concatArrays(
+    encodeField(FIELD.IMAGE_WIDTH, WIRE_TYPE.VARINT, width),
+    encodeField(FIELD.IMAGE_HEIGHT, WIRE_TYPE.VARINT, height)
+  );
+  return concatArrays(
+    encodeField(FIELD.IMAGE_DATA, WIRE_TYPE.LEN, parsed.data),
+    encodeField(FIELD.IMAGE_DIMENSION, WIRE_TYPE.LEN, dimension)
   );
 }
 
@@ -519,12 +632,13 @@ export function encodeRequest(messages, modelName, tools = [], reasoningEffort =
     const isLast = i === normalizedMessages.length - 1;
 
     formattedMessages.push({
-      content: msg.content,
+      content: msg.content || "",
       role,
       messageId: msgId,
       isLast,
       hasTools,
-      toolResults: msg.tool_results || []
+      toolResults: msg.tool_results || [],
+      images: Array.isArray(msg.images) ? msg.images : []
     });
 
     messageIds.push({ messageId: msgId, role });
@@ -540,7 +654,7 @@ export function encodeRequest(messages, modelName, tools = [], reasoningEffort =
     // Messages
     ...formattedMessages.map(fm => 
       encodeField(FIELD.MESSAGES, WIRE_TYPE.LEN, 
-        encodeMessage(fm.content, fm.role, fm.messageId, null, fm.isLast, fm.hasTools, fm.toolResults)
+        encodeMessage(fm.content, fm.role, fm.messageId, null, fm.isLast, fm.hasTools, fm.toolResults, null, fm.images)
       )
     ),
     
