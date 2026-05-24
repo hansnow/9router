@@ -3,7 +3,6 @@ import { PROVIDERS } from "../config/providers.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import {
   generateCursorBody,
-  parseConnectRPCFrame,
   extractTextFromResponse
 } from "../utils/cursorProtobuf.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
@@ -37,6 +36,7 @@ const COMPRESS_FLAG = {
 };
 
 const CURSOR_STREAM_DEBUG = process.env.CURSOR_STREAM_DEBUG === "1";
+const HTTP2_IDLE_TIMEOUT_MS = Number(process.env.CURSOR_HTTP2_IDLE_TIMEOUT_MS || 120000);
 const debugLog = (...args) => {
   if (CURSOR_STREAM_DEBUG) console.log(...args);
 };
@@ -229,6 +229,418 @@ function createErrorResponse(jsonError) {
   });
 }
 
+function createOpenAIErrorResponse(message, status = HTTP_STATUS.SERVER_ERROR, type = "api_error", code = "") {
+  return new Response(JSON.stringify({
+    error: {
+      message,
+      type,
+      code
+    }
+  }), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+function createSSEHeaders() {
+  return {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive"
+  };
+}
+
+export class ConnectRPCFrameBuffer {
+  constructor() {
+    this.buffer = Buffer.alloc(0);
+    this.frameCount = 0;
+  }
+
+  push(chunk) {
+    if (!chunk || chunk.length === 0) return [];
+
+    this.buffer = this.buffer.length === 0
+      ? Buffer.from(chunk)
+      : Buffer.concat([this.buffer, Buffer.from(chunk)]);
+
+    const frames = [];
+    while (this.buffer.length >= 5) {
+      const flags = this.buffer[0];
+      const length = this.buffer.readUInt32BE(1);
+      if (this.buffer.length < 5 + length) break;
+
+      let payload = this.buffer.slice(5, 5 + length);
+      this.buffer = this.buffer.slice(5 + length);
+      this.frameCount++;
+
+      debugLog(
+        `[CURSOR STREAM FRAME] Frame ${this.frameCount}: flags=0x${flags.toString(16).padStart(2, "0")}, length=${length}`
+      );
+
+      payload = decompressPayload(payload, flags);
+      if (!payload) {
+        debugLog(`[CURSOR STREAM FRAME] Frame ${this.frameCount}: decompression failed, skipping`);
+        continue;
+      }
+
+      frames.push({ flags, length, payload });
+    }
+
+    return frames;
+  }
+
+  hasBufferedData() {
+    return this.buffer.length > 0;
+  }
+}
+
+class CursorSSEStreamEncoder {
+  constructor(model, body) {
+    this.responseId = `chatcmpl-cursor-${Date.now()}`;
+    this.created = Math.floor(Date.now() / 1000);
+    this.model = model;
+    this.body = body;
+
+    this.totalContent = "";
+    this.totalThinking = "";
+    this.emittedThinkingVisibleContentLength = 0;
+    this.pendingContent = "";
+    this.insidePseudoToolBlock = false;
+    this.pseudoToolBuffer = "";
+    this.toolCalls = [];
+    this.toolCallsMap = new Map();
+    this.hasOutput = false;
+    this.hasSignal = false;
+    this.finished = false;
+    this.frameCount = 0;
+  }
+
+  processPayload(payload) {
+    if (this.finished) return { events: [] };
+    this.frameCount++;
+
+    const jsonErrorResponse = this.handleJSONErrorPayload(payload);
+    if (jsonErrorResponse) return jsonErrorResponse;
+
+    const result = extractTextFromResponse(new Uint8Array(payload));
+    debugLog(`[CURSOR DECODED STREAM] Frame ${this.frameCount}:`, result);
+
+    if (result.error) {
+      return this.handleDecodedError(result.error);
+    }
+
+    const events = [];
+    if (result.toolCall) {
+      this.hasSignal = true;
+      events.push(...this.handleNativeToolCall(result.toolCall));
+    }
+
+    if (result.text) {
+      this.hasSignal = true;
+      events.push(...this.appendVisibleContent(result.text));
+    }
+
+    if (isThinkingTailVisibleModel(this.model) && result.thinking) {
+      this.hasSignal = true;
+      this.totalThinking += result.thinking;
+      const visibleContent = visibleContentFromThinking(this.totalThinking);
+      if (visibleContent.length > this.emittedThinkingVisibleContentLength) {
+        const deltaContent = visibleContent.slice(this.emittedThinkingVisibleContentLength);
+        this.emittedThinkingVisibleContentLength = visibleContent.length;
+        events.push(...this.appendVisibleContent(deltaContent));
+      }
+    } else if (result.thinking) {
+      this.hasSignal = true;
+    }
+
+    return { events };
+  }
+
+  finish() {
+    if (this.finished) return { events: [] };
+    this.finished = true;
+
+    const events = [];
+    if (!this.insidePseudoToolBlock) {
+      events.push(...this.emitPendingContent({ final: true }));
+    }
+
+    if (this.hasOpenOutput()) {
+      events.push(this.finishChunk());
+      events.push("data: [DONE]\n\n");
+      return { events };
+    }
+
+    if (this.hasSignal) {
+      events.push(this.roleChunk());
+      events.push(this.finishChunk());
+      events.push("data: [DONE]\n\n");
+      return { events };
+    }
+
+    return {
+      errorResponse: createOpenAIErrorResponse(
+        "Cursor returned an empty response without text, thinking, or tool calls",
+        HTTP_STATUS.SERVER_ERROR,
+        "upstream_error",
+        "empty_response"
+      )
+    };
+  }
+
+  handleJSONErrorPayload(payload) {
+    if (!payload || payload.length === 0 || payload[0] !== 0x7b) return null;
+
+    try {
+      const text = payload.toString("utf-8");
+      if (!text.includes('"error"')) return null;
+
+      debugLog(
+        `[CURSOR STREAM] Error frame (hasOutput=${this.hasOpenOutput()}): ${text.slice(0, 500)}`
+      );
+
+      const parsed = JSON.parse(text);
+      if (!this.hasOpenOutput()) {
+        return { errorResponse: createErrorResponse(parsed), errorPayload: parsed };
+      }
+
+      return { events: [this.errorEvent(parsed), "data: [DONE]\n\n"], terminal: true };
+    } catch {
+      return null;
+    }
+  }
+
+  handleDecodedError(error) {
+    debugLog(`[CURSOR STREAM] Decoded error (hasOutput=${this.hasOpenOutput()}): ${error}`);
+    const payload = {
+      error: { message: error, type: "rate_limit_error", code: "rate_limited" }
+    };
+    if (!this.hasOpenOutput()) {
+      return {
+        errorResponse: createOpenAIErrorResponse(
+          error,
+          HTTP_STATUS.RATE_LIMITED,
+          "rate_limit_error",
+          "rate_limited"
+        ),
+        errorPayload: payload
+      };
+    }
+
+    return {
+      events: [
+        this.errorEvent(payload),
+        "data: [DONE]\n\n"
+      ],
+      terminal: true
+    };
+  }
+
+  handleNativeToolCall(tc) {
+    let toolCallIndex;
+    let argsDelta = tc.function.arguments || "";
+    let isFirstChunk = false;
+
+    if (this.toolCallsMap.has(tc.id)) {
+      const existing = this.toolCallsMap.get(tc.id);
+      toolCallIndex = existing.index;
+      existing.function.arguments += argsDelta;
+      existing.isLast = tc.isLast;
+    } else {
+      toolCallIndex = this.toolCalls.length;
+      isFirstChunk = true;
+      const stored = { ...tc, index: toolCallIndex, function: { ...tc.function } };
+      this.toolCalls.push(stored);
+      this.toolCallsMap.set(tc.id, stored);
+    }
+
+    return [this.toolCallChunk(tc, toolCallIndex, { argsDelta, isFirstChunk })];
+  }
+
+  appendVisibleContent(content) {
+    if (!content) return [];
+
+    const events = [];
+    if (this.insidePseudoToolBlock) {
+      this.pseudoToolBuffer += content;
+      events.push(...this.tryFinishPseudoToolBlock());
+      return events;
+    }
+
+    this.pendingContent += content;
+    const markerIndex = this.pendingContent.indexOf(PSEUDO_TOOL_MARKERS.callsBegin);
+    if (markerIndex >= 0) {
+      const before = this.pendingContent.slice(0, markerIndex).trimEnd();
+      const pseudoStart = this.pendingContent.slice(markerIndex);
+      this.pendingContent = before;
+      events.push(...this.emitPendingContent({ final: true }));
+      this.pendingContent = "";
+      this.insidePseudoToolBlock = true;
+      this.pseudoToolBuffer = pseudoStart;
+      events.push(...this.tryFinishPseudoToolBlock());
+      return events;
+    }
+
+    events.push(...this.emitPendingContent({ final: false }));
+    return events;
+  }
+
+  tryFinishPseudoToolBlock() {
+    const endIndex = this.pseudoToolBuffer.indexOf(PSEUDO_TOOL_MARKERS.callsEnd);
+    if (endIndex < 0) return [];
+
+    const blockEnd = endIndex + PSEUDO_TOOL_MARKERS.callsEnd.length;
+    const pseudoBlock = this.pseudoToolBuffer.slice(0, blockEnd);
+    const after = this.pseudoToolBuffer.slice(blockEnd).trimStart();
+    const parsed = parseCursorPseudoToolCalls(pseudoBlock);
+
+    this.insidePseudoToolBlock = false;
+    this.pseudoToolBuffer = "";
+
+    const events = [];
+    for (const tc of parsed.toolCalls) {
+      const toolCallIndex = this.toolCalls.length;
+      this.toolCalls.push({ ...tc, index: toolCallIndex });
+      events.push(this.toolCallChunk(tc, toolCallIndex, {
+        argsDelta: tc.function.arguments,
+        isFirstChunk: true
+      }));
+    }
+
+    if (after) {
+      const prefix = this.totalContent ? "\n" : "";
+      events.push(...this.appendVisibleContent(prefix + after));
+    }
+
+    return events;
+  }
+
+  emitPendingContent({ final }) {
+    if (!this.pendingContent) return [];
+
+    let emitLength = this.pendingContent.length;
+    if (!final) {
+      const marker = PSEUDO_TOOL_MARKERS.callsBegin;
+      let holdLength = 0;
+      const maxHold = Math.min(marker.length - 1, this.pendingContent.length);
+      for (let length = 1; length <= maxHold; length++) {
+        if (marker.startsWith(this.pendingContent.slice(-length))) {
+          holdLength = length;
+        }
+      }
+
+      const stableContent = this.pendingContent.slice(0, this.pendingContent.length - holdLength);
+      const trailingWhitespace = stableContent.match(/\s+$/)?.[0]?.length || 0;
+      emitLength -= holdLength + trailingWhitespace;
+    }
+
+    if (emitLength <= 0) return [];
+
+    const content = this.pendingContent.slice(0, emitLength);
+    this.pendingContent = this.pendingContent.slice(emitLength);
+    this.totalContent += content;
+    return [this.contentChunk(content)];
+  }
+
+  hasOpenOutput() {
+    return this.hasOutput || this.totalContent.length > 0 || this.toolCalls.length > 0;
+  }
+
+  contentChunk(content) {
+    const includeRole = !this.hasOutput;
+    this.hasOutput = true;
+    return `data: ${JSON.stringify({
+      id: this.responseId,
+      object: "chat.completion.chunk",
+      created: this.created,
+      model: this.model,
+      choices: [
+        {
+          index: 0,
+          delta: includeRole ? { role: "assistant", content } : { content },
+          finish_reason: null
+        }
+      ]
+    })}\n\n`;
+  }
+
+  roleChunk() {
+    this.hasOutput = true;
+    return `data: ${JSON.stringify({
+      id: this.responseId,
+      object: "chat.completion.chunk",
+      created: this.created,
+      model: this.model,
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant", content: "" },
+          finish_reason: null
+        }
+      ]
+    })}\n\n`;
+  }
+
+  toolCallChunk(tc, index, { argsDelta, isFirstChunk }) {
+    const events = [];
+    if (!this.hasOutput && this.totalContent.length === 0) {
+      events.push(this.roleChunk());
+    }
+
+    this.hasOutput = true;
+    const toolCall = {
+      index,
+      function: {
+        arguments: argsDelta || ""
+      }
+    };
+    if (isFirstChunk) {
+      toolCall.id = tc.id;
+      toolCall.type = "function";
+      toolCall.function.name = tc.function.name;
+    }
+
+    events.push(`data: ${JSON.stringify({
+      id: this.responseId,
+      object: "chat.completion.chunk",
+      created: this.created,
+      model: this.model,
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [toolCall] },
+          finish_reason: null
+        }
+      ]
+    })}\n\n`);
+
+    return events.join("");
+  }
+
+  finishChunk() {
+    const usage = estimateUsage(this.body, this.totalContent.length, FORMATS.OPENAI);
+    return `data: ${JSON.stringify({
+      id: this.responseId,
+      object: "chat.completion.chunk",
+      created: this.created,
+      model: this.model,
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: this.toolCalls.length > 0 ? "tool_calls" : "stop"
+        }
+      ],
+      usage
+    })}\n\n`;
+  }
+
+  errorEvent(errorPayload) {
+    this.finished = true;
+    return `event: error\ndata: ${JSON.stringify(errorPayload)}\n\n`;
+  }
+}
+
 export class CursorExecutor extends BaseExecutor {
   constructor() {
     super("cursor", PROVIDERS.cursor);
@@ -282,28 +694,31 @@ export class CursorExecutor extends BaseExecutor {
       throw new Error("http2 module not available");
     }
 
-    const HTTP2_TIMEOUT_MS = 60000; // 60s max — prevent hung sessions
-
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
       const client = http2.connect(`https://${urlObj.host}`);
       const chunks = [];
       let responseHeaders = {};
       let settled = false;
+      let idleTimeout = null;
+
+      const resetIdleTimeout = () => {
+        clearTimeout(idleTimeout);
+        idleTimeout = setTimeout(finish(() => {
+          reject(new Error(`HTTP/2 request idle timeout after ${HTTP2_IDLE_TIMEOUT_MS}ms without upstream data`));
+        }), HTTP2_IDLE_TIMEOUT_MS);
+      };
 
       // Ensure client is always closed on settle
       const finish = (fn) => (...args) => {
         if (settled) return;
         settled = true;
-        clearTimeout(hangTimeout);
+        clearTimeout(idleTimeout);
         client.close();
         fn(...args);
       };
 
-      // Hard timeout: close session if server never responds
-      const hangTimeout = setTimeout(finish(() => {
-        reject(new Error("HTTP/2 request timed out"));
-      }), HTTP2_TIMEOUT_MS);
+      resetIdleTimeout();
 
       client.on("error", finish(reject));
 
@@ -315,8 +730,14 @@ export class CursorExecutor extends BaseExecutor {
         ...headers
       });
 
-      req.on("response", (hdrs) => { responseHeaders = hdrs; });
-      req.on("data", (chunk) => { chunks.push(chunk); });
+      req.on("response", (hdrs) => {
+        responseHeaders = hdrs;
+        resetIdleTimeout();
+      });
+      req.on("data", (chunk) => {
+        chunks.push(chunk);
+        resetIdleTimeout();
+      });
       req.on("end", finish(() => {
         resolve({
           status: responseHeaders[":status"],
@@ -336,6 +757,221 @@ export class CursorExecutor extends BaseExecutor {
     });
   }
 
+  makeHttp2StreamingResponse(url, headers, body, model, requestBody, signal) {
+    if (!http2) {
+      throw new Error("http2 module not available");
+    }
+
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url);
+      const client = http2.connect(`https://${urlObj.host}`);
+      const frameBuffer = new ConnectRPCFrameBuffer();
+      const encoder = new CursorSSEStreamEncoder(model, requestBody);
+      const textEncoder = new TextEncoder();
+      let controllerRef = null;
+      let responseHeaders = {};
+      let settled = false;
+      let responseResolved = false;
+      let streamClosed = false;
+      let idleTimeout = null;
+      let req = null;
+      let upstreamStatus = null;
+      const upstreamErrorChunks = [];
+
+      const resolveStream = () => {
+        if (responseResolved) return;
+        responseResolved = true;
+        resolve(new Response(stream, {
+          status: 200,
+          headers: createSSEHeaders()
+        }));
+      };
+
+      const closeResources = () => {
+        clearTimeout(idleTimeout);
+        try { req?.close(); } catch {}
+        try { client.close(); } catch {}
+      };
+
+      const settleWithError = (error) => {
+        if (settled) return;
+        settled = true;
+        closeResources();
+        if (!responseResolved) {
+          reject(error);
+          return;
+        }
+        if (!streamClosed) {
+          streamClosed = true;
+          try {
+            controllerRef?.enqueue(textEncoder.encode(
+              `event: error\ndata: ${JSON.stringify({ error: { message: error.message, type: "connection_error" } })}\n\n`
+            ));
+            controllerRef?.enqueue(textEncoder.encode("data: [DONE]\n\n"));
+            controllerRef?.close();
+          } catch {}
+        }
+      };
+
+      const resetIdleTimeout = () => {
+        clearTimeout(idleTimeout);
+        idleTimeout = setTimeout(() => {
+          settleWithError(new Error(`HTTP/2 request idle timeout after ${HTTP2_IDLE_TIMEOUT_MS}ms without upstream data`));
+        }, HTTP2_IDLE_TIMEOUT_MS);
+      };
+
+      const enqueueEvents = (events) => {
+        if (!events || events.length === 0) return;
+        resolveStream();
+        for (const event of events) {
+          if (event) controllerRef.enqueue(textEncoder.encode(event));
+        }
+      };
+
+      const keepAlive = () => {
+        resolveStream();
+        controllerRef.enqueue(textEncoder.encode(": cursor-upstream\n\n"));
+      };
+
+      const finishStream = () => {
+        if (settled) return;
+
+        if (upstreamStatus && upstreamStatus !== 200) {
+          settled = true;
+          closeResources();
+          const errorText = upstreamErrorChunks.length > 0
+            ? Buffer.concat(upstreamErrorChunks).toString()
+            : `Cursor upstream returned HTTP ${upstreamStatus}`;
+          resolve(new Response(JSON.stringify({
+            error: {
+              message: `[${upstreamStatus}]: ${errorText}`,
+              type: "invalid_request_error",
+              code: ""
+            }
+          }), {
+            status: upstreamStatus,
+            headers: { "Content-Type": "application/json" }
+          }));
+          return;
+        }
+
+        if (frameBuffer.hasBufferedData()) {
+          closeResources();
+          settleWithError(new Error("Cursor upstream ended with an incomplete ConnectRPC frame"));
+          return;
+        }
+
+        settled = true;
+        closeResources();
+
+        const result = encoder.finish();
+        if (result.errorResponse && !responseResolved) {
+          resolve(result.errorResponse);
+          return;
+        }
+
+        enqueueEvents(result.events);
+        if (!streamClosed) {
+          streamClosed = true;
+          controllerRef.close();
+        }
+      };
+
+      const stream = new ReadableStream({
+        start(controller) {
+          controllerRef = controller;
+        },
+        cancel() {
+          settled = true;
+          streamClosed = true;
+          closeResources();
+        }
+      });
+
+      resetIdleTimeout();
+      client.on("error", settleWithError);
+
+      req = client.request({
+        ":method": "POST",
+        ":path": urlObj.pathname,
+        ":authority": urlObj.host,
+        ":scheme": "https",
+        ...headers
+      });
+
+      req.on("response", (hdrs) => {
+        responseHeaders = hdrs;
+        resetIdleTimeout();
+        upstreamStatus = responseHeaders[":status"];
+      });
+
+      req.on("data", (chunk) => {
+        if (settled) return;
+        resetIdleTimeout();
+        if (upstreamStatus && upstreamStatus !== 200) {
+          upstreamErrorChunks.push(Buffer.from(chunk));
+          return;
+        }
+        try {
+          const frames = frameBuffer.push(chunk);
+          for (const frame of frames) {
+            const result = encoder.processPayload(frame.payload);
+
+            if (result.errorResponse) {
+              settled = true;
+              closeResources();
+              if (!responseResolved) {
+                resolve(result.errorResponse);
+              } else if (!streamClosed) {
+                const errorPayload = result.errorPayload || {
+                  error: {
+                    message: "Cursor upstream error after stream started",
+                    type: "upstream_error"
+                  }
+                };
+                streamClosed = true;
+                controllerRef.enqueue(textEncoder.encode(
+                  `event: error\ndata: ${JSON.stringify(errorPayload)}\n\n`
+                ));
+                controllerRef.enqueue(textEncoder.encode("data: [DONE]\n\n"));
+                controllerRef.close();
+              }
+              return;
+            }
+
+            if (result.events?.length > 0) {
+              enqueueEvents(result.events);
+            } else if (responseResolved) {
+              keepAlive();
+            }
+            if (result.terminal) {
+              settled = true;
+              closeResources();
+              if (!streamClosed) {
+                streamClosed = true;
+                controllerRef.close();
+              }
+              return;
+            }
+          }
+        } catch (error) {
+          settleWithError(error);
+        }
+      });
+
+      req.on("end", finishStream);
+      req.on("error", settleWithError);
+
+      if (signal) {
+        const onAbort = () => settleWithError(new Error("Request aborted"));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      req.write(body);
+      req.end();
+    });
+  }
+
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
     const url = this.buildUrl();
     const headers = this.buildHeaders(credentials);
@@ -343,6 +979,11 @@ export class CursorExecutor extends BaseExecutor {
 
     try {
       const shouldForceFetch = proxyOptions?.enabled === true || proxyOptions?.connectionProxyEnabled === true || !!proxyOptions?.vercelRelayUrl;
+      if (stream !== false && http2 && !shouldForceFetch) {
+        const response = await this.makeHttp2StreamingResponse(url, headers, transformedBody, model, body, signal);
+        return { response, url, headers, transformedBody: body };
+      }
+
       const response = (http2 && !shouldForceFetch)
         ? await this.makeHttp2Request(url, headers, transformedBody, signal)
         : await this.makeFetchRequest(url, headers, transformedBody, signal, proxyOptions);
@@ -561,268 +1202,53 @@ export class CursorExecutor extends BaseExecutor {
   }
 
   transformProtobufToSSE(buffer, model, body) {
-    const responseId = `chatcmpl-cursor-${Date.now()}`;
-    const created = Math.floor(Date.now() / 1000);
+    return this.transformProtobufChunksToSSE([buffer], model, body);
+  }
 
+  transformProtobufChunksToSSE(chunksInput, model, body) {
+    const frameBuffer = new ConnectRPCFrameBuffer();
+    const encoder = new CursorSSEStreamEncoder(model, body);
     const chunks = [];
-    let offset = 0;
-    let totalContent = "";
-    let totalThinking = "";
-    let emittedThinkingVisibleContentLength = 0;
-    const toolCalls = [];
-    const toolCallsMap = new Map(); // Track streaming tool calls by ID
-    const finalizedIds = new Set();
-    let frameCount = 0;
-    const emitRoleChunk = () => {
-      chunks.push(
-        `data: ${JSON.stringify({
-          id: responseId,
-          object: "chat.completion.chunk",
-          created,
-          model,
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: "" },
-              finish_reason: null
-            }
-          ]
-        })}\n\n`
-      );
-    };
-    const emitContentChunk = (content) => {
-      if (!content) return;
-      chunks.push(
-        `data: ${JSON.stringify({
-          id: responseId,
-          object: "chat.completion.chunk",
-          created,
-          model,
-          choices: [
-            {
-              index: 0,
-              delta:
-                chunks.length === 0
-                  ? { role: "assistant", content }
-                  : { content },
-              finish_reason: null
-            }
-          ]
-        })}\n\n`
-      );
-    };
-    const emitToolCallChunk = (tc, index) => {
-      chunks.push(
-        `data: ${JSON.stringify({
-          id: responseId,
-          object: "chat.completion.chunk",
-          created,
-          model,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                tool_calls: [
-                  {
-                    index,
-                    id: tc.id,
-                    type: "function",
-                    function: {
-                      name: tc.function.name,
-                      arguments: tc.function.arguments
-                    }
-                  }
-                ]
-              },
-              finish_reason: null
-            }
-          ]
-        })}\n\n`
-      );
-    };
 
-    debugLog(`[CURSOR BUFFER SSE] Total length: ${buffer.length} bytes`);
+    const totalLength = chunksInput.reduce((sum, chunk) => sum + chunk.length, 0);
+    debugLog(`[CURSOR BUFFER SSE] Total length: ${totalLength} bytes`);
 
-    while (offset < buffer.length) {
-      if (offset + 5 > buffer.length) {
-        debugLog(
-          `[CURSOR BUFFER SSE] Reached end, offset=${offset}, remaining=${buffer.length - offset}`
-        );
-        break;
-      }
-
-      const flags = buffer[offset];
-      const length = buffer.readUInt32BE(offset + 1);
-
-      debugLog(
-        `[CURSOR BUFFER SSE] Frame ${frameCount + 1}: flags=0x${flags.toString(16).padStart(2, "0")}, length=${length}`
-      );
-
-      if (offset + 5 + length > buffer.length) {
-        debugLog(
-          `[CURSOR BUFFER SSE] Incomplete frame, offset=${offset}, length=${length}, buffer.length=${buffer.length}`
-        );
-        break;
-      }
-
-      let payload = buffer.slice(offset + 5, offset + 5 + length);
-      offset += 5 + length;
-      frameCount++;
-
-      payload = decompressPayload(payload, flags);
-      if (!payload) {
-        debugLog(`[CURSOR BUFFER SSE] Frame ${frameCount}: decompression failed, skipping`);
-        continue;
-      }
-
-      // Check for JSON error frames (byte-guard: only decode if starts with '{')
-      if (payload[0] === 0x7b) {
-        try {
-          const text = payload.toString("utf-8");
-          if (text.includes('"error"')) {
-            const hasContent = chunks.length > 0 || totalContent || toolCallsMap.size > 0;
-            debugLog(
-              `[CURSOR BUFFER SSE] Error frame (hasContent=${hasContent}): ${text.slice(0, 500)}`
-            );
-            if (hasContent) {
-              break;
-            }
-            return createErrorResponse(JSON.parse(text));
-          }
-        } catch {}
-      }
-
-      const result = extractTextFromResponse(new Uint8Array(payload));
-      debugLog(`[CURSOR DECODED SSE] Frame ${frameCount}:`, result);
-
-      if (result.error) {
-        const hasContent = chunks.length > 0 || totalContent || toolCallsMap.size > 0;
-        debugLog(`[CURSOR BUFFER SSE] Decoded error (hasContent=${hasContent}): ${result.error}`);
-        if (hasContent) {
+    let terminal = false;
+    for (const chunk of chunksInput) {
+      if (terminal) break;
+      for (const frame of frameBuffer.push(chunk)) {
+        const result = encoder.processPayload(frame.payload);
+        if (result.errorResponse && chunks.length === 0) {
+          return result.errorResponse;
+        }
+        if (result.events) chunks.push(...result.events);
+        if (result.terminal) {
+          terminal = true;
           break;
         }
-        return new Response(
-          JSON.stringify({
-            error: {
-              message: result.error,
-              type: "rate_limit_error",
-              code: "rate_limited"
-            }
-          }),
-          {
-            status: HTTP_STATUS.RATE_LIMITED,
-            headers: { "Content-Type": "application/json" }
-          }
-        );
-      }
-
-      if (result.toolCall) {
-        const tc = result.toolCall;
-
-        if (toolCallsMap.has(tc.id)) {
-          // Accumulate arguments for existing tool call
-          const existing = toolCallsMap.get(tc.id);
-          existing.function.arguments += tc.function.arguments;
-          existing.isLast = tc.isLast;
-          const emitted = toolCalls[existing.index];
-          if (emitted) {
-            emitted.function.arguments = existing.function.arguments;
-            emitted.isLast = existing.isLast;
-          }
-        } else {
-          // New tool call - assign index and add to map
-          const toolCallIndex = toolCalls.length;
-          finalizedIds.add(tc.id);
-          toolCalls.push({ ...tc, index: toolCallIndex });
-          toolCallsMap.set(tc.id, { ...tc, index: toolCallIndex });
-        }
-      }
-
-      if (result.text) {
-        totalContent += result.text;
-      }
-
-      if (isThinkingTailVisibleModel(model) && result.thinking) {
-        totalThinking += result.thinking;
-        const visibleContent = visibleContentFromThinking(totalThinking);
-        if (visibleContent.length > emittedThinkingVisibleContentLength) {
-          const deltaContent = visibleContent.slice(emittedThinkingVisibleContentLength);
-          emittedThinkingVisibleContentLength = visibleContent.length;
-          totalContent += deltaContent;
-        }
       }
     }
 
-    debugLog(
-      `[CURSOR BUFFER SSE] Parsed ${frameCount} frames, toolCallsMap size: ${toolCallsMap.size}, toolCalls array: ${toolCalls.length}`
-    );
+    if (!terminal && frameBuffer.hasBufferedData()) {
+      return createOpenAIErrorResponse(
+        "Cursor upstream ended with an incomplete ConnectRPC frame",
+        HTTP_STATUS.SERVER_ERROR,
+        "upstream_error",
+        "incomplete_frame"
+      );
+    }
 
-    // Finalize all remaining tool calls in map (stream may have ended without isLast=true)
-    for (const [id, tc] of toolCallsMap.entries()) {
-      if (!finalizedIds.has(id)) {
-        debugLog(`[CURSOR BUFFER SSE] Finalizing incomplete tool call: ${id}, isLast=${tc.isLast}`);
-        const toolCallIndex = toolCalls.length;
-        toolCalls.push({
-          id: tc.id,
-          type: tc.type,
-          index: toolCallIndex,
-          function: {
-            name: tc.function.name,
-            arguments: tc.function.arguments
-          }
-        });
+    if (!terminal && !encoder.finished) {
+      const result = encoder.finish();
+      if (result.errorResponse && chunks.length === 0) {
+        return result.errorResponse;
       }
+      if (result.events) chunks.push(...result.events);
     }
-
-    const pseudoToolParse = parseCursorPseudoToolCalls(totalContent);
-    totalContent = pseudoToolParse.content;
-    emitContentChunk(totalContent);
-
-    if (chunks.length === 0 && (toolCalls.length > 0 || pseudoToolParse.toolCalls.length > 0)) {
-      emitRoleChunk();
-    }
-
-    for (const tc of toolCalls) {
-      emitToolCallChunk(tc, tc.index ?? 0);
-    }
-
-    for (const tc of pseudoToolParse.toolCalls) {
-      const toolCallIndex = toolCalls.length;
-      toolCalls.push({ ...tc, index: toolCallIndex });
-      emitToolCallChunk(tc, toolCallIndex);
-    }
-
-    if (chunks.length === 0 && toolCalls.length === 0) {
-      emitRoleChunk();
-    }
-
-    const usage = estimateUsage(body, totalContent.length, FORMATS.OPENAI);
-
-    chunks.push(
-      `data: ${JSON.stringify({
-        id: responseId,
-        object: "chat.completion.chunk",
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            delta: {},
-            finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop"
-          }
-        ],
-        usage
-      })}\n\n`
-    );
-    chunks.push("data: [DONE]\n\n");
 
     return new Response(chunks.join(""), {
       status: 200,
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      }
+      headers: createSSEHeaders()
     });
   }
 
